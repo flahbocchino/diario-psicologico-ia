@@ -3,110 +3,199 @@ from streamlit_gsheets import GSheetsConnection
 import pandas as pd
 from datetime import date, timedelta
 import plotly.express as px
+import hashlib
 
-st.set_page_config(page_title="Monitor de Saúde Mental", layout="wide")
+st.set_page_config(page_title="Monitor de Saúde Mental", layout="wide", page_icon="🧠")
 
-# URL da sua planilha (que você já configurou como Editor)
-url = "https://docs.google.com/spreadsheets/d/1vSR4W34p1g80bie4CjRdyzm1_OJliRpA0VUtnNz1D_g/edit?usp=sharing"
+# Conexão com a planilha
 conn = st.connection("gsheets", type=GSheetsConnection)
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1vSR4W34p1g80bie4CjRdyzm1_OJliRpA0VUtnNz1D_g/edit?usp=sharing"
 
-st.title("🧠 Diário Psicológico Inteligente")
+# Colunas fixas — sempre nesta ordem
+COLUNAS = ["data", "nome", "codigo_usuario", "Humor", "Irritabilidade",
+           "Bateria", "Sono", "Nevoa", "Pressao", "remedios"]
 
-# 1. IDENTIFICAÇÃO (Cadastro/Login)
-nome_usuario = st.text_input("Digite seu nome ou apelido fictício para login:", placeholder="Ex: Usuário01")
+def gerar_codigo(nome, senha):
+    """Gera um código único combinando nome + senha"""
+    texto = f"{nome.strip().lower()}:{senha.strip()}"
+    return hashlib.md5(texto.encode()).hexdigest()[:8]
 
-if nome_usuario:
-    st.sidebar.success(f"Logado como: {nome_usuario}")
-    
-    # 2. MEDICAMENTOS
-    st.subheader("💊 Gestão de Medicamentos")
-    remedios_input = st.text_area("Liste os remédios que você toma (Nome, Dosagem, Horário):", 
-                                  placeholder="Ex: Sertralina 50mg - 08:00")
+def ler_dados():
+    try:
+        df = conn.read(spreadsheet=SHEET_URL, usecols=COLUNAS, ttl=5)
+        return df.dropna(how="all")
+    except:
+        return pd.DataFrame(columns=COLUNAS)
 
-    # 3. QUESTIONÁRIO DIÁRIO
-    st.markdown("---")
-    st.subheader("📝 Como você está hoje?")
-    
-    with st.form("diario_form"):
-        c1, c2 = st.columns(2)
-        with c1:
-            humor = st.select_slider("Humor (Triste -> Feliz)", options=[1,2,3,4,5], value=3)
-            irritabilidade = st.select_slider("Irritabilidade (Calmo -> Irritado)", options=[1,2,3,4,5], value=1)
-            bateria = st.select_slider("Bateria Social (Esgotado -> Sociável)", options=[1,2,3,4,5], value=3)
-        with c2:
-            sono = st.select_slider("Qualidade do Sono (Péssimo -> Ótimo)", options=[1,2,3,4,5], value=3)
-            nevoa = st.select_slider("Foco/Névoa Mental (Confuso -> Claro)", options=[1,2,3,4,5], value=3)
-            pressao = st.select_slider("Sentimento de Pressão (Tranquilo -> Exausto)", options=[1,2,3,4,5], value=1)
-        
-        st.info("Você alterou ou quer atualizar seus remédios hoje?")
-        atualizar_rem = st.checkbox("Sim, atualizar dados de medicação")
-        
-        submit = st.form_submit_button("Salvar Registro Diário")
+def salvar_registro(dados_dict):
+    df_atual = ler_dados()
+    novo = pd.DataFrame([dados_dict])
+    df_final = pd.concat([df_atual, novo], ignore_index=True)
+    # Garante que as colunas estão na ordem certa
+    for col in COLUNAS:
+        if col not in df_final.columns:
+            df_final[col] = ""
+    df_final = df_final[COLUNAS]
+    conn.update(spreadsheet=SHEET_URL, data=df_final)
 
-    if submit:
-        # Preparar dados para salvar
-        novo_registro = pd.DataFrame([{
-            "data": str(date.today()),
-            "Humor": humor,
-            "Irritabilidade": irritabilidade,
-            "Bateria": bateria,
-            "Sono": sono,
-            "Nevoa": nevoa,
-            "Pressao": pressao,
-            "nome": nome_usuario,
-            "remedios": remedios_input
-        }])
-        
-        try:
-            # Tenta ler dados existentes para não apagar o que já tem
-            try:
-                df_atual = conn.read(spreadsheet=url)
-            except:
-                df_atual = pd.DataFrame()
-                
-            df_final = pd.concat([df_atual, novo_registro], ignore_index=True)
-            conn.update(spreadsheet=url, data=df_final)
-            st.balloons()
-            st.success("✅ Registro salvo com sucesso!")
-        except Exception as e:
-            st.error(f"Erro ao salvar: {e}")
+# ─── TELA DE LOGIN ───────────────────────────────────────────
+st.title("🧠 Monitor de Saúde Mental")
 
-    # 4. RELATÓRIOS E ALERTAS (Lógica de 7 dias)
-    st.markdown("---")
-    st.subheader("📊 Análise de Padrões e Relatórios")
-    
-    if st.button("Gerar Relatório de 7 Dias"):
-        try:
-            df_completo = conn.read(spreadsheet=url)
-            # Filtra apenas os dados do usuário atual
-            df_user = df_completo[df_completo['nome'] == nome_usuario].copy()
-            
-            if df_user.empty:
-                st.warning("Você ainda não possui registros cadastrados.")
+if "usuario_logado" not in st.session_state:
+    st.session_state.usuario_logado = None
+    st.session_state.codigo_usuario = None
+
+if st.session_state.usuario_logado is None:
+    st.subheader("Entrar no sistema")
+    st.info("Use um nome fictício se preferir manter sua privacidade.")
+
+    with st.form("login_form"):
+        nome = st.text_input("Seu nome ou apelido", placeholder="Ex: Borboleta Azul")
+        senha = st.text_input("Crie uma senha pessoal", type="password",
+                              placeholder="Só você precisa saber")
+        col1, col2 = st.columns(2)
+        with col1:
+            entrar = st.form_submit_button("✅ Entrar / Cadastrar")
+
+    if entrar:
+        if nome.strip() == "" or senha.strip() == "":
+            st.error("Por favor, preencha nome e senha.")
+        else:
+            codigo = gerar_codigo(nome, senha)
+            st.session_state.usuario_logado = nome.strip()
+            st.session_state.codigo_usuario = codigo
+            st.rerun()
+
+    st.stop()
+
+# ─── USUÁRIO LOGADO ──────────────────────────────────────────
+nome_usuario = st.session_state.usuario_logado
+codigo_usuario = st.session_state.codigo_usuario
+
+st.sidebar.success(f"👤 Logado como: {nome_usuario}")
+if st.sidebar.button("Sair"):
+    st.session_state.usuario_logado = None
+    st.session_state.codigo_usuario = None
+    st.rerun()
+
+# ─── MEDICAMENTOS ─────────────────────────────────────────────
+st.subheader("💊 Gestão de Medicamentos")
+df_todos = ler_dados()
+
+# Busca último registro de remédios deste usuário
+remedios_salvos = ""
+if not df_todos.empty and "codigo_usuario" in df_todos.columns:
+    df_user = df_todos[df_todos["codigo_usuario"] == codigo_usuario]
+    if not df_user.empty and "remedios" in df_user.columns:
+        remedios_salvos = df_user["remedios"].dropna().iloc[-1] if not df_user["remedios"].dropna().empty else ""
+
+remedios_input = st.text_area(
+    "Remédios que você toma (Nome, Dosagem, Horário):",
+    value=remedios_salvos,
+    placeholder="Ex: Sertralina 50mg - manhã\nClonazepam 0,5mg - noite"
+)
+
+# ─── QUESTIONÁRIO DIÁRIO ──────────────────────────────────────
+st.markdown("---")
+st.subheader("📝 Como você está hoje?")
+
+with st.form("diario_form"):
+    c1, c2 = st.columns(2)
+    with c1:
+        humor = st.select_slider("😊 Humor (Triste → Feliz)", options=[1,2,3,4,5], value=3)
+        irritabilidade = st.select_slider("😤 Irritabilidade (Calmo → Irritado)", options=[1,2,3,4,5], value=1)
+        bateria = st.select_slider("🔋 Bateria Social (Esgotado → Sociável)", options=[1,2,3,4,5], value=3)
+    with c2:
+        sono = st.select_slider("😴 Qualidade do Sono (Péssimo → Ótimo)", options=[1,2,3,4,5], value=3)
+        nevoa = st.select_slider("🧩 Foco Mental (Confuso → Claro)", options=[1,2,3,4,5], value=3)
+        pressao = st.select_slider("🌡️ Pressão Interna (Tranquilo → Exausto)", options=[1,2,3,4,5], value=1)
+
+    atualizar_rem = st.checkbox("Quero atualizar meus remédios junto com este registro")
+    submit = st.form_submit_button("💾 Salvar Registro de Hoje")
+
+if submit:
+    dados = {
+        "data": str(date.today()),
+        "nome": nome_usuario,
+        "codigo_usuario": codigo_usuario,
+        "Humor": humor,
+        "Irritabilidade": irritabilidade,
+        "Bateria": bateria,
+        "Sono": sono,
+        "Nevoa": nevoa,
+        "Pressao": pressao,
+        "remedios": remedios_input if atualizar_rem else remedios_salvos
+    }
+    try:
+        salvar_registro(dados)
+        st.balloons()
+        st.success("✅ Registro salvo com sucesso!")
+    except Exception as e:
+        st.error(f"Erro ao salvar: {e}")
+
+# ─── RELATÓRIO E ALERTAS ──────────────────────────────────────
+st.markdown("---")
+st.subheader("📊 Análise de Padrões e Relatórios")
+
+if st.button("📈 Gerar Relatório dos Últimos 7 Dias"):
+    df_todos = ler_dados()
+
+    if df_todos.empty or "codigo_usuario" not in df_todos.columns:
+        st.warning("Ainda não há dados na planilha.")
+    else:
+        df_user = df_todos[df_todos["codigo_usuario"] == codigo_usuario].copy()
+
+        if df_user.empty:
+            st.markdown("""
+            <div style="background:#ffcccc;padding:20px;border-radius:10px;border:2px solid #cc0000;text-align:center">
+                <h3 style="color:#cc0000">⚠️ Sem registros encontrados</h3>
+                <p>Você ainda não fez nenhum registro. Comece hoje!</p>
+            </div>""", unsafe_allow_html=True)
+        else:
+            df_user["data"] = pd.to_datetime(df_user["data"])
+            limite = pd.to_datetime(date.today() - timedelta(days=7))
+            df_7dias = df_user[df_user["data"] >= limite]
+
+            if df_7dias.empty:
+                st.markdown("""
+                <div style="background:#ffcccc;padding:20px;border-radius:10px;border:2px solid #cc0000;text-align:center">
+                    <h3 style="color:#cc0000">⚠️ Sem participação esta semana</h3>
+                    <p>Nenhum registro nos últimos 7 dias. Tente manter a constância!</p>
+                </div>""", unsafe_allow_html=True)
             else:
-                df_user['data'] = pd.to_datetime(df_user['data'])
-                uma_semana_atras = pd.to_datetime(date.today() - timedelta(days=7))
-                df_7dias = df_user[df_user['data'] >= uma_semana_atras]
+                # Gráfico
+                metricas = ["Humor", "Sono", "Pressao", "Irritabilidade", "Bateria", "Nevoa"]
+                metricas_existentes = [m for m in metricas if m in df_7dias.columns]
+                fig = px.line(df_7dias, x="data", y=metricas_existentes,
+                              title=f"Evolução de {nome_usuario} — Últimos 7 dias",
+                              markers=True, labels={"data": "Data", "value": "Nível (1-5)"})
+                fig.update_layout(yaxis=dict(range=[0,6], tickmode="linear", dtick=1))
+                st.plotly_chart(fig, use_container_width=True)
 
-                if df_7dias.empty:
-                    st.markdown("<div style='background-color: #ffcccc; padding: 15px; border-radius: 5px; color: #990000; text-align: center;'><b>⚠️ AVISO:</b> Você não participou nos últimos 7 dias.</div>", unsafe_allow_html=True)
+                registros = len(df_7dias)
+                if registros < 7:
+                    st.warning(f"Você registrou {registros} de 7 dias esta semana.")
                 else:
-                    fig = px.line(df_7dias, x="data", y=["Humor", "Sono", "Pressao"], 
-                                  title="Sua Evolução na Semana", markers=True)
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.success("🎉 Semana completa! Todos os 7 dias registrados.")
 
-                    # ALERTA AMARELO PARA O PROFISSIONAL
-                    if len(df_7dias) >= 3:
-                        media_pressao = df_7dias['Pressao'].tail(3).mean()
-                        if media_pressao >= 4:
-                            st.markdown("""
-                            <div style="background-color: #ffffcc; padding: 20px; border: 2px solid #ffcc00; border-radius: 10px;">
-                                <h3 style="color: #665500; margin-top: 0;">⚠️ ALERTA AO PROFISSIONAL</h3>
-                                <p>Padrão de <b>esgotamento/burnout</b> detectado. Recomenda-se revisão imediata.</p>
-                            </div>
-                            """, unsafe_allow_html=True)
-        except:
-            st.info("Ainda não há dados na planilha para analisar.")
+                # ─── ALERTA DE BURNOUT ────────────────────────────────
+                alertas = []
+                if len(df_7dias) >= 3:
+                    if df_7dias["Pressao"].tail(3).mean() >= 4:
+                        alertas.append("Pressão interna persistentemente alta")
+                    if df_7dias["Humor"].tail(3).mean() <= 2:
+                        alertas.append("Humor consistentemente baixo")
+                    if df_7dias["Sono"].tail(3).mean() <= 2:
+                        alertas.append("Qualidade de sono muito baixa")
+                    if df_7dias["Irritabilidade"].tail(3).mean() >= 4:
+                        alertas.append("Irritabilidade elevada nos últimos dias")
 
-else:
-    st.info("Por favor, digite seu nome no campo acima para acessar o sistema.")
+                if alertas:
+                    itens = "".join([f"<li>{a}</li>" for a in alertas])
+                    st.markdown(f"""
+                    <div style="background:#fffacc;padding:20px;border-radius:10px;border:2px solid #e6c200;margin-top:15px">
+                        <h3 style="color:#7a6000;margin-top:0">⚠️ Atenção — Sinais de Alerta Detectados</h3>
+                        <p style="color:#444"><b>Para o profissional de saúde:</b> O paciente <b>{nome_usuario}</b> apresentou os seguintes padrões:</p>
+                        <ul style="color:#444">{itens}</ul>
+                        <p style="color:#444">Recomenda-se revisão dos procedimentos terapêuticos.</p>
+                    </div>""", unsafe_allow_html=True)
