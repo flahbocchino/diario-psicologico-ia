@@ -6,6 +6,13 @@ import plotly.graph_objects as go
 import plotly.express as px
 import hashlib
 import numpy as np
+import io
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
 st.set_page_config(page_title="Monitor de Saúde Mental", layout="wide", page_icon="🧠")
 
@@ -41,7 +48,7 @@ SHEET_URL = "https://docs.google.com/spreadsheets/d/1vSR4W34p1g80bie4CjRdyzm1_OJ
 COLUNAS   = ["data", "nome", "codigo_usuario", "Humor", "Irritabilidade",
              "Bateria", "Sono", "Nevoa", "Pressao", "remedios"]
 
-# ─── FUNÇÕES ──────────────────────────────────────────────────
+# ─── FUNÇÕES DE DADOS ─────────────────────────────────────────
 def gerar_codigo(nome, senha):
     texto = f"{nome.strip().lower()}:{senha.strip()}"
     return hashlib.md5(texto.encode()).hexdigest()[:8]
@@ -68,12 +75,12 @@ def calcular_risco_burnout(df):
         return 0, "Sem dados"
     pontos = 0
     total  = 0
-    pesos = {"Pressao": (True,  2.0),
-             "Humor":   (False, 2.0),
-             "Sono":    (False, 1.5),
-             "Irritabilidade": (True, 1.5),
-             "Bateria": (False, 1.0),
-             "Nevoa":   (False, 1.0)}
+    pesos = {"Pressao":        (True,  2.0),
+             "Humor":          (False, 2.0),
+             "Sono":           (False, 1.5),
+             "Irritabilidade": (True,  1.5),
+             "Bateria":        (False, 1.0),
+             "Nevoa":          (False, 1.0)}
     for col, (direto, peso) in pesos.items():
         if col in df.columns:
             media = df[col].tail(5).mean()
@@ -82,12 +89,33 @@ def calcular_risco_burnout(df):
             total  += peso
     risco = round((pontos / total) * 100) if total > 0 else 0
     if risco >= 70:
-        nivel = "🔴 Alto Risco"
+        nivel = "Alto Risco"
     elif risco >= 40:
-        nivel = "🟡 Atenção"
+        nivel = "Atenção"
     else:
-        nivel = "🟢 Estável"
+        nivel = "Estável"
     return risco, nivel
+
+def calcular_correlacoes(df):
+    if len(df) < 5:
+        return []
+    insights = []
+    pares = [
+        ("Sono",   "Humor",          "positiva", "Quando o sono melhora, o humor tende a melhorar também"),
+        ("Pressao","Humor",           "negativa", "Quando a pressão aumenta, o humor tende a cair"),
+        ("Pressao","Irritabilidade",  "positiva", "Pressão alta está ligada ao aumento de irritabilidade"),
+        ("Sono",   "Nevoa",           "positiva", "Sono ruim está associado a mais névoa mental"),
+        ("Bateria","Humor",           "positiva", "Baixa bateria social coincide com queda no humor"),
+    ]
+    for col1, col2, tipo, descricao in pares:
+        if col1 not in df.columns or col2 not in df.columns:
+            continue
+        corr = df[col1].corr(df[col2])
+        if tipo == "positiva" and corr > 0.5:
+            insights.append(f"{descricao} (força: {corr:.2f})")
+        elif tipo == "negativa" and corr < -0.5:
+            insights.append(f"{descricao} (força: {abs(corr):.2f})")
+    return insights
 
 def detectar_padroes_semanais(df):
     if len(df) < 7:
@@ -104,41 +132,211 @@ def detectar_padroes_semanais(df):
         por_dia = df.groupby("dia_semana")[metrica].mean()
         for dia_num, media_dia in por_dia.items():
             if media_dia < media_geral * 0.75 and metrica in ["Humor","Sono"]:
-                padroes.append(f"📉 Toda **{dias_pt[dia_num]}** o {EMOJIS[metrica]} {metrica} costuma ser mais baixo")
+                padroes.append(f"Toda {dias_pt[dia_num]} o {metrica} costuma ser mais baixo")
             if media_dia > media_geral * 1.25 and metrica == "Pressao":
-                padroes.append(f"📈 Toda **{dias_pt[dia_num]}** a {EMOJIS['Pressao']} Pressão costuma ser mais alta")
+                padroes.append(f"Toda {dias_pt[dia_num]} a Pressão costuma ser mais alta")
     return padroes
 
-def calcular_correlacoes(df):
-    if len(df) < 5:
-        return []
-    insights = []
-    pares = [
-        ("Sono",   "Humor",         "positiva", "Quando o sono melhora, o humor tende a melhorar também"),
-        ("Pressao","Humor",          "negativa", "Quando a pressão aumenta, o humor tende a cair"),
-        ("Pressao","Irritabilidade", "positiva", "Pressão alta está ligada ao aumento de irritabilidade"),
-        ("Sono",   "Nevoa",          "positiva", "Sono ruim está associado a mais névoa mental"),
-        ("Bateria","Humor",          "positiva", "Baixa bateria social coincide com queda no humor"),
-    ]
-    for col1, col2, tipo, descricao in pares:
-        if col1 not in df.columns or col2 not in df.columns:
-            continue
-        corr = df[col1].corr(df[col2])
-        if tipo == "positiva" and corr > 0.5:
-            insights.append(f"🔗 {descricao} (força: {corr:.2f})")
-        elif tipo == "negativa" and corr < -0.5:
-            insights.append(f"🔗 {descricao} (força: {abs(corr):.2f})")
-    return insights
-
 def comparar_semanas(df_user):
-    """Divide o histórico em semanas e compara as médias"""
     if len(df_user) < 7:
         return None
     df_user = df_user.copy().sort_values("data")
-    df_user["semana"] = df_user["data"].dt.isocalendar().week.astype(str) + \
-                        "/" + df_user["data"].dt.year.astype(str)
-    resumo = df_user.groupby("semana")[METRICAS].mean().round(2).reset_index()
-    return resumo
+    df_user["semana"] = (df_user["data"].dt.isocalendar().week.astype(str)
+                         + "/" + df_user["data"].dt.year.astype(str))
+    return df_user.groupby("semana")[METRICAS].mean().round(2).reset_index()
+
+# ─── GERADOR DE PDF ───────────────────────────────────────────
+def gerar_pdf(nome_usuario, df_7dias, risco, nivel_risco,
+              insights, padroes, remedios_salvos):
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                            rightMargin=2*cm, leftMargin=2*cm,
+                            topMargin=2*cm, bottomMargin=2*cm)
+
+    styles = getSampleStyleSheet()
+    estilo_titulo = ParagraphStyle("titulo",
+        fontSize=20, fontName="Helvetica-Bold",
+        textColor=colors.HexColor("#1a237e"),
+        spaceAfter=6, alignment=TA_CENTER)
+    estilo_subtitulo = ParagraphStyle("subtitulo",
+        fontSize=13, fontName="Helvetica-Bold",
+        textColor=colors.HexColor("#283593"),
+        spaceAfter=4, spaceBefore=14)
+    estilo_corpo = ParagraphStyle("corpo",
+        fontSize=10, fontName="Helvetica",
+        textColor=colors.HexColor("#333333"),
+        spaceAfter=4, leading=16)
+    estilo_alerta = ParagraphStyle("alerta",
+        fontSize=11, fontName="Helvetica-Bold",
+        textColor=colors.HexColor("#cc0000"),
+        spaceAfter=4)
+    estilo_ok = ParagraphStyle("ok",
+        fontSize=11, fontName="Helvetica-Bold",
+        textColor=colors.HexColor("#2e7d32"),
+        spaceAfter=4)
+
+    elementos = []
+
+    # Cabeçalho
+    elementos.append(Paragraph("🧠 Relatório de Saúde Mental", estilo_titulo))
+    elementos.append(Paragraph(f"Paciente: {nome_usuario}", estilo_titulo))
+    elementos.append(Spacer(1, 0.3*cm))
+    elementos.append(HRFlowable(width="100%", thickness=1,
+                                color=colors.HexColor("#3949ab")))
+    elementos.append(Spacer(1, 0.3*cm))
+
+    periodo_ini = df_7dias["data"].min().strftime("%d/%m/%Y")
+    periodo_fim = df_7dias["data"].max().strftime("%d/%m/%Y")
+    elementos.append(Paragraph(
+        f"Período analisado: {periodo_ini} a {periodo_fim}   |   "
+        f"Registros: {len(df_7dias)} de 7 dias   |   "
+        f"Gerado em: {date.today().strftime('%d/%m/%Y')}",
+        estilo_corpo))
+    elementos.append(Spacer(1, 0.4*cm))
+
+    # Medicamentos
+    if remedios_salvos.strip():
+        elementos.append(Paragraph("Medicamentos em uso", estilo_subtitulo))
+        for linha in remedios_salvos.strip().split("\n"):
+            if linha.strip():
+                elementos.append(Paragraph(f"• {linha.strip()}", estilo_corpo))
+        elementos.append(Spacer(1, 0.3*cm))
+
+    # Risco de burnout
+    elementos.append(Paragraph("Risco de Burnout", estilo_subtitulo))
+    elementos.append(HRFlowable(width="100%", thickness=0.5,
+                                color=colors.HexColor("#cccccc")))
+    elementos.append(Spacer(1, 0.2*cm))
+
+    if risco >= 70:
+        elementos.append(Paragraph(
+            f"⚠ ALTO RISCO — {risco}%  |  {nivel_risco}", estilo_alerta))
+        elementos.append(Paragraph(
+            "O paciente apresenta indicadores críticos. "
+            "Recomenda-se revisão urgente dos procedimentos terapêuticos.",
+            estilo_corpo))
+    elif risco >= 40:
+        elementos.append(Paragraph(
+            f"⚠ ATENÇÃO — {risco}%  |  {nivel_risco}",
+            ParagraphStyle("atencao", fontSize=11, fontName="Helvetica-Bold",
+                           textColor=colors.HexColor("#e65100"), spaceAfter=4)))
+        elementos.append(Paragraph(
+            "O paciente apresenta sinais de alerta moderados. "
+            "Recomenda-se atenção redobrada.",
+            estilo_corpo))
+    else:
+        elementos.append(Paragraph(
+            f"✓ ESTÁVEL — {risco}%  |  {nivel_risco}", estilo_ok))
+        elementos.append(Paragraph(
+            "Nenhum sinal crítico detectado nesta semana.", estilo_corpo))
+
+    elementos.append(Spacer(1, 0.4*cm))
+
+    # Tabela de médias
+    elementos.append(Paragraph("Médias da Semana por Indicador", estilo_subtitulo))
+    elementos.append(HRFlowable(width="100%", thickness=0.5,
+                                color=colors.HexColor("#cccccc")))
+    elementos.append(Spacer(1, 0.2*cm))
+
+    cabecalho = ["Indicador", "Média (1-5)", "Mínimo", "Máximo", "Tendência"]
+    linhas = [cabecalho]
+    for m in METRICAS:
+        if m not in df_7dias.columns:
+            continue
+        serie = df_7dias[m].dropna()
+        media = serie.mean()
+        minv  = serie.min()
+        maxv  = serie.max()
+        if len(serie) >= 3:
+            z = np.polyfit(np.arange(len(serie)), serie.values.astype(float), 1)
+            tend = "↑ Subindo" if z[0] > 0.1 else ("↓ Caindo" if z[0] < -0.1 else "→ Estável")
+        else:
+            tend = "—"
+        linhas.append([m, f"{media:.1f}", f"{minv:.0f}", f"{maxv:.0f}", tend])
+
+    tabela = Table(linhas, colWidths=[4*cm, 3*cm, 2.5*cm, 2.5*cm, 3.5*cm])
+    tabela.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,0),  colors.HexColor("#3949ab")),
+        ("TEXTCOLOR",     (0,0), (-1,0),  colors.white),
+        ("FONTNAME",      (0,0), (-1,0),  "Helvetica-Bold"),
+        ("FONTSIZE",      (0,0), (-1,-1), 9),
+        ("ALIGN",         (0,0), (-1,-1), "CENTER"),
+        ("ROWBACKGROUNDS",(0,1), (-1,-1),
+         [colors.HexColor("#f5f5f5"), colors.white]),
+        ("GRID",          (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
+        ("TOPPADDING",    (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+    ]))
+    elementos.append(tabela)
+    elementos.append(Spacer(1, 0.5*cm))
+
+    # Tabela diária
+    elementos.append(Paragraph("Registros Diários", estilo_subtitulo))
+    elementos.append(HRFlowable(width="100%", thickness=0.5,
+                                color=colors.HexColor("#cccccc")))
+    elementos.append(Spacer(1, 0.2*cm))
+
+    colunas_diario = ["Data"] + METRICAS
+    dados_diario = [colunas_diario]
+    for _, row in df_7dias.sort_values("data").iterrows():
+        linha = [row["data"].strftime("%d/%m")]
+        for m in METRICAS:
+            linha.append(str(int(row[m])) if m in row and pd.notna(row[m]) else "—")
+        dados_diario.append(linha)
+
+    tab_diario = Table(dados_diario,
+                       colWidths=[2*cm] + [2.4*cm]*len(METRICAS))
+    tab_diario.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,0),  colors.HexColor("#5c6bc0")),
+        ("TEXTCOLOR",     (0,0), (-1,0),  colors.white),
+        ("FONTNAME",      (0,0), (-1,0),  "Helvetica-Bold"),
+        ("FONTSIZE",      (0,0), (-1,-1), 9),
+        ("ALIGN",         (0,0), (-1,-1), "CENTER"),
+        ("ROWBACKGROUNDS",(0,1), (-1,-1),
+         [colors.HexColor("#f5f5f5"), colors.white]),
+        ("GRID",          (0,0), (-1,-1), 0.5, colors.HexColor("#cccccc")),
+        ("TOPPADDING",    (0,0), (-1,-1), 5),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+    ]))
+    elementos.append(tab_diario)
+    elementos.append(Spacer(1, 0.5*cm))
+
+    # Insights
+    if insights:
+        elementos.append(Paragraph("Correlações Identificadas", estilo_subtitulo))
+        elementos.append(HRFlowable(width="100%", thickness=0.5,
+                                    color=colors.HexColor("#cccccc")))
+        elementos.append(Spacer(1, 0.2*cm))
+        for ins in insights:
+            elementos.append(Paragraph(f"• {ins}", estilo_corpo))
+        elementos.append(Spacer(1, 0.3*cm))
+
+    # Padrões
+    if padroes:
+        elementos.append(Paragraph("Padrões por Dia da Semana", estilo_subtitulo))
+        elementos.append(HRFlowable(width="100%", thickness=0.5,
+                                    color=colors.HexColor("#cccccc")))
+        elementos.append(Spacer(1, 0.2*cm))
+        for p in padroes:
+            elementos.append(Paragraph(f"• {p}", estilo_corpo))
+        elementos.append(Spacer(1, 0.3*cm))
+
+    # Rodapé
+    elementos.append(HRFlowable(width="100%", thickness=1,
+                                color=colors.HexColor("#3949ab")))
+    elementos.append(Spacer(1, 0.2*cm))
+    elementos.append(Paragraph(
+        "Este relatório foi gerado automaticamente pelo Monitor de Saúde Mental. "
+        "As informações são de caráter auxiliar e devem ser interpretadas "
+        "pelo profissional de saúde responsável.",
+        ParagraphStyle("rodape", fontSize=8, fontName="Helvetica",
+                       textColor=colors.HexColor("#888888"),
+                       alignment=TA_CENTER)))
+
+    doc.build(elementos)
+    buffer.seek(0)
+    return buffer
 
 # ─── LOGIN ────────────────────────────────────────────────────
 st.title("🧠 Monitor de Saúde Mental")
@@ -242,8 +440,7 @@ if st.button("📈 Gerar Relatório dos Últimos 7 Dias"):
     if df_user.empty:
         st.markdown("""<div style="background:#fff0f0;border:2px solid #ff4444;
         border-radius:12px;padding:20px"><h3 style="color:#cc0000">⚠️ Sem registros</h3>
-        <p>Você ainda não fez nenhum registro. Comece hoje!</p></div>""",
-        unsafe_allow_html=True)
+        <p>Você ainda não fez nenhum registro.</p></div>""", unsafe_allow_html=True)
         st.stop()
 
     df_user["data"] = pd.to_datetime(df_user["data"])
@@ -257,31 +454,28 @@ if st.button("📈 Gerar Relatório dos Últimos 7 Dias"):
         <p>Nenhum registro nos últimos 7 dias.</p></div>""", unsafe_allow_html=True)
         st.stop()
 
+    risco, nivel_risco = calcular_risco_burnout(df_7dias)
+    insights = calcular_correlacoes(df_7dias)
+    padroes  = detectar_padroes_semanais(df_user)
+
     # 1. RISCO DE BURNOUT
     st.markdown("### 🔥 Risco de Burnout")
-    risco, nivel_risco = calcular_risco_burnout(df_7dias)
     cor_barra = "#4CAF50" if risco < 40 else ("#FF9800" if risco < 70 else "#F44336")
-
     fig_gauge = go.Figure(go.Indicator(
         mode="gauge+number",
         value=risco,
         title={"text": f"Nível de Risco — {nivel_risco}", "font": {"size": 18, "color": "#333"}},
         number={"suffix": "%", "font": {"size": 36, "color": "#333"}},
-        gauge={
-            "axis": {"range": [0, 100], "tickcolor": "#333"},
-            "bar":  {"color": cor_barra},
-            "steps": [
-                {"range": [0,  40], "color": "#e8f5e9"},
-                {"range": [40, 70], "color": "#fff8e1"},
-                {"range": [70,100], "color": "#ffebee"},
-            ],
-        }
+        gauge={"axis": {"range": [0,100]}, "bar": {"color": cor_barra},
+               "steps": [{"range": [0,40],  "color": "#e8f5e9"},
+                          {"range": [40,70], "color": "#fff8e1"},
+                          {"range": [70,100],"color": "#ffebee"}]}
     ))
     fig_gauge.update_layout(paper_bgcolor="#f8f9fa", font=dict(color="#333"),
                             height=280, margin=dict(l=30,r=30,t=60,b=20))
     st.plotly_chart(fig_gauge, use_container_width=True)
 
-    # 2. CARDS DE MÉDIAS
+    # 2. CARDS
     st.markdown("### 📋 Resumo da Semana")
     cols = st.columns(len(METRICAS))
     for i, m in enumerate(METRICAS):
@@ -303,7 +497,7 @@ if st.button("📈 Gerar Relatório dos Últimos 7 Dias"):
             x=df_7dias["data"], y=df_7dias[metrica],
             mode="lines+markers", name=metrica,
             line=dict(color=CORES_METRICAS[metrica], width=2),
-            marker=dict(size=7), opacity=0.9
+            marker=dict(size=7)
         ))
         if len(df_7dias) >= 3:
             x_num = np.arange(len(df_7dias))
@@ -313,8 +507,7 @@ if st.button("📈 Gerar Relatório dos Últimos 7 Dias"):
                 p = np.poly1d(z)
                 sinal = "↑ subindo" if z[0] > 0.1 else ("↓ caindo" if z[0] < -0.1 else "→ estável")
                 fig.add_trace(go.Scatter(
-                    x=df_7dias["data"], y=p(x_num),
-                    mode="lines",
+                    x=df_7dias["data"], y=p(x_num), mode="lines",
                     name=f"Tendência {metrica} ({sinal})",
                     line=dict(color=CORES_METRICAS[metrica], width=1, dash="dot"),
                     opacity=0.45
@@ -322,11 +515,11 @@ if st.button("📈 Gerar Relatório dos Últimos 7 Dias"):
             except:
                 pass
     fig.update_layout(
-        plot_bgcolor="#ffffff", paper_bgcolor="#f8f9fa",
-        font=dict(color="#333"),
+        plot_bgcolor="#ffffff", paper_bgcolor="#f8f9fa", font=dict(color="#333"),
         legend=dict(bgcolor="#ffffff", bordercolor="#e0e0e0"),
         xaxis=dict(gridcolor="#e0e0e0", title="Data"),
-        yaxis=dict(gridcolor="#e0e0e0", range=[0,6], tickmode="linear", dtick=1, title="Nível (1-5)"),
+        yaxis=dict(gridcolor="#e0e0e0", range=[0,6], tickmode="linear",
+                   dtick=1, title="Nível (1-5)"),
         hovermode="x unified", margin=dict(l=20,r=20,t=40,b=20)
     )
     st.plotly_chart(fig, use_container_width=True)
@@ -349,8 +542,8 @@ if st.button("📈 Gerar Relatório dos Últimos 7 Dias"):
     )
     st.plotly_chart(fig_radar, use_container_width=True)
 
-    # 5. MAPA DE CORRELAÇÕES
-    st.markdown("### 🔗 Mapa de Correlações entre Indicadores")
+    # 5. CORRELAÇÕES
+    st.markdown("### 🔗 Mapa de Correlações")
     metricas_ex = [m for m in METRICAS if m in df_7dias.columns]
     if len(df_7dias) >= 4:
         corr_matrix = df_7dias[metricas_ex].corr().round(2)
@@ -361,8 +554,6 @@ if st.button("📈 Gerar Relatório dos Últimos 7 Dias"):
                                margin=dict(l=20,r=20,t=60,b=20))
         st.plotly_chart(fig_corr, use_container_width=True)
         st.caption("💡 +1 = sobem juntos | -1 = um sobe quando o outro cai | 0 = sem relação")
-    else:
-        st.info("Necessário pelo menos 4 registros para correlações.")
 
     # 6. COMPARAÇÃO ENTRE SEMANAS
     st.markdown("### 📆 Comparação entre Semanas")
@@ -372,80 +563,82 @@ if st.button("📈 Gerar Relatório dos Últimos 7 Dias"):
         for metrica in METRICAS:
             if metrica in resumo_semanas.columns:
                 fig_semanas.add_trace(go.Scatter(
-                    x=resumo_semanas["semana"],
-                    y=resumo_semanas[metrica],
-                    mode="lines+markers",
-                    name=metrica,
+                    x=resumo_semanas["semana"], y=resumo_semanas[metrica],
+                    mode="lines+markers", name=metrica,
                     line=dict(color=CORES_METRICAS[metrica], width=2),
                     marker=dict(size=8)
                 ))
         fig_semanas.update_layout(
-            title="Média de cada indicador por semana — evolução ao longo do tempo",
-            plot_bgcolor="#ffffff", paper_bgcolor="#f8f9fa",
-            font=dict(color="#333"),
+            title="Evolução semanal ao longo do tempo",
+            plot_bgcolor="#ffffff", paper_bgcolor="#f8f9fa", font=dict(color="#333"),
             xaxis=dict(title="Semana", gridcolor="#e0e0e0"),
-            yaxis=dict(title="Média (1-5)", range=[0,6],
-                       tickmode="linear", dtick=1, gridcolor="#e0e0e0"),
+            yaxis=dict(title="Média (1-5)", range=[0,6], tickmode="linear",
+                       dtick=1, gridcolor="#e0e0e0"),
             hovermode="x unified", margin=dict(l=20,r=20,t=60,b=20)
         )
         st.plotly_chart(fig_semanas, use_container_width=True)
-        st.markdown("**Médias por semana:**")
         st.dataframe(resumo_semanas.set_index("semana"), use_container_width=True)
     else:
-        st.info("📆 Com mais semanas de dados, aparecerá aqui um gráfico comparando a evolução semana a semana.")
+        st.info("📆 Com mais semanas de dados aparecerá aqui a comparação entre semanas.")
 
-    # 7. PADRÕES SEMANAIS
+    # 7. PADRÕES E INSIGHTS
     st.markdown("### 📅 Padrões por Dia da Semana")
-    padroes = detectar_padroes_semanais(df_user)
     if padroes:
         for p in padroes:
             st.markdown(f"- {p}")
     else:
-        st.info("Necessário pelo menos 7 registros para detectar padrões por dia.")
+        st.info("Necessário pelo menos 7 registros para detectar padrões.")
 
-    # 8. INSIGHTS
     st.markdown("### 💡 Insights Detectados")
-    insights = calcular_correlacoes(df_7dias)
     if insights:
         for ins in insights:
             st.markdown(f"- {ins}")
     else:
         st.info("Necessário pelo menos 5 registros para detectar correlações.")
 
-    # 9. PARTICIPAÇÃO
+    # 8. PARTICIPAÇÃO
     registros = len(df_7dias)
     if registros < 7:
         st.warning(f"📅 Você registrou {registros} de 7 dias esta semana.")
     else:
         st.success("🎉 Semana completa! Todos os 7 dias registrados.")
 
-    # 10. ALERTA FINAL
+    # 9. ALERTA FINAL
     if risco >= 70:
-        st.markdown(f"""
-        <div style="background:#fff0f0;border:2px solid #F44336;
-                    border-radius:12px;padding:20px;margin-top:15px">
-            <h3 style="color:#cc0000;margin-top:0">🔴 ALTO RISCO — Ação Recomendada</h3>
-            <p style="color:#444">O paciente <b>{nome_usuario}</b> apresenta risco de burnout
-            de <b>{risco}%</b>. Recomenda-se revisão urgente.</p>
-        </div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div style="background:#fff0f0;border:2px solid #F44336;
+        border-radius:12px;padding:20px;margin-top:15px">
+        <h3 style="color:#cc0000;margin-top:0">🔴 ALTO RISCO — Ação Recomendada</h3>
+        <p style="color:#444">O paciente <b>{nome_usuario}</b> apresenta risco de burnout
+        de <b>{risco}%</b>. Recomenda-se revisão urgente.</p></div>""",
+        unsafe_allow_html=True)
     elif risco >= 40:
-        st.markdown(f"""
-        <div style="background:#fffbe6;border:2px solid #FF9800;
-                    border-radius:12px;padding:20px;margin-top:15px">
-            <h3 style="color:#e65100;margin-top:0">🟡 ATENÇÃO — Monitorar de Perto</h3>
-            <p style="color:#444">O paciente <b>{nome_usuario}</b> apresenta risco moderado
-            de <b>{risco}%</b>. Atenção redobrada esta semana.</p>
-        </div>""", unsafe_allow_html=True)
+        st.markdown(f"""<div style="background:#fffbe6;border:2px solid #FF9800;
+        border-radius:12px;padding:20px;margin-top:15px">
+        <h3 style="color:#e65100;margin-top:0">🟡 ATENÇÃO — Monitorar de Perto</h3>
+        <p style="color:#444">O paciente <b>{nome_usuario}</b> apresenta risco moderado
+        de <b>{risco}%</b>.</p></div>""", unsafe_allow_html=True)
     else:
-        st.success(f"🟢 Risco baixo ({risco}%) — Nenhum sinal crítico esta semana. Continue assim!")
-```
+        st.success(f"🟢 Risco baixo ({risco}%) — Nenhum sinal crítico esta semana!")
 
-E o `requirements.txt` atualizado:
-```
-streamlit
-st-gsheets-connection
-pandas
-plotly
-numpy
-    else:
-        st.success("✅ Nenhum sinal de alerta detectado esta semana. Continue assim!")
+    # 10. BOTÃO DE DOWNLOAD DO PDF
+    st.markdown("---")
+    st.markdown("### 📄 Relatório em PDF para a Psicóloga")
+    st.info("Clique abaixo para gerar e baixar o relatório completo em PDF.")
+
+    pdf_buffer = gerar_pdf(
+        nome_usuario=nome_usuario,
+        df_7dias=df_7dias,
+        risco=risco,
+        nivel_risco=nivel_risco,
+        insights=insights,
+        padroes=padroes,
+        remedios_salvos=remedios_salvos
+    )
+
+    nome_arquivo = f"relatorio_{nome_usuario.replace(' ','_')}_{date.today()}.pdf"
+    st.download_button(
+        label="⬇️ Baixar Relatório PDF",
+        data=pdf_buffer,
+        file_name=nome_arquivo,
+        mime="application/pdf"
+    )
